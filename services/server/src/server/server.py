@@ -5,6 +5,15 @@ import queue
 import logger
 import protocol
 from lottery import Lottery, Bet
+from dataclasses import dataclass, field
+
+@dataclass
+class _CoordState:
+    quorum_min: int
+    notified: set = field(default_factory=set)
+    pending: list = field(default_factory=list)
+    quorum_reached: bool = False
+    winners_by_agency: dict = field(default_factory=dict)
 
 
 class Server:
@@ -66,11 +75,7 @@ class Server:
                 t.join(timeout=2.0)
 
     def _run_coordinator(self):
-        """Hilo coordinador: dueño exclusivo del estado de agencias y de la lotería."""
-        notified_agencies = set()
-        pending_agencies = []
-        quorum_reached = False
-        winners_by_agency = {}
+        state = _CoordState(self.agency_quorum_min)
 
         while self.is_running:
             try:
@@ -79,52 +84,95 @@ class Server:
                 continue
 
             if msg is None or msg[0] == "STOP":
-                for _, reply_q in pending_agencies:
+                for _, reply_q in state.pending:
                     reply_q.put(None)
                 break
 
             msg_type = msg[0]
-
             if msg_type == "STORE_BETS":
-                _, bets, reply_q = msg
-                try:
-                    self.lottery.store_bets(bets)
-                    reply_q.put(True)
-                except Exception as e:
-                    reply_q.put(e)
-
+                self._coord_store_bets(msg)
             elif msg_type == "END_BETS":
-                _, agency_id, reply_q = msg
-                notified_agencies.add(agency_id)
-
-                if not quorum_reached and len(notified_agencies) >= self.agency_quorum_min:
-                    quorum_reached = True
-                    pending_agencies.append((agency_id, reply_q))
-                    winners_map = {}
-                    for bet in self.lottery.load_bets():
-                        if self.lottery.has_won(bet):
-                            winners_map.setdefault(bet.agency_id, []).append(
-                                f"{bet.first_name},{bet.last_name},{bet.document},{bet.birthdate},{bet.number}"
-                            )
-                    winners_by_agency = {}
-                    for aid, lines in winners_map.items():
-                        winners_by_agency[aid] = "\n".join(lines).encode("utf-8") + b"\n"
-
-                    for aid, q in pending_agencies:
-                        q.put(winners_by_agency.get(aid, b""))
-                    pending_agencies.clear()
-
-                elif not quorum_reached:
-                    pending_agencies.append((agency_id, reply_q))
-
-                else:
-                    reply_q.put(winners_by_agency.get(agency_id, b""))
-
+                self._coord_end_bets(msg, state)
             elif msg_type == "DISCONNECT":
-                _, reply_q = msg
-                pending_agencies = [
-                    (aid, q) for aid, q in pending_agencies if q != reply_q
-                ]
+                self._coord_disconnect(msg, state)
+
+    def _coord_store_bets(self, msg):
+        _, bets, reply_q = msg
+        try:
+            self.lottery.store_bets(bets)
+            reply_q.put(True)
+        except Exception as e:
+            reply_q.put(e)
+
+    def _coord_end_bets(self, msg, state: _CoordState):
+        _, agency_id, reply_q = msg
+        state.notified.add(agency_id)
+
+        if not state.quorum_reached and len(state.notified) >= state.quorum_min:
+            state.quorum_reached = True
+            state.pending.append((agency_id, reply_q))
+            
+            winners_map = {}
+            for bet in self.lottery.load_bets():
+                if self.lottery.has_won(bet):
+                    winners_map.setdefault(bet.agency_id, []).append(
+                        f"{bet.first_name},{bet.last_name},{bet.document},{bet.birthdate},{bet.number}"
+                    )
+            
+            for aid, lines in winners_map.items():
+                state.winners_by_agency[aid] = "\n".join(lines).encode("utf-8") + b"\n"
+
+            for aid, q in state.pending:
+                q.put(state.winners_by_agency.get(aid, b""))
+            state.pending.clear()
+
+        elif not state.quorum_reached:
+            state.pending.append((agency_id, reply_q))
+        else:
+            reply_q.put(state.winners_by_agency.get(agency_id, b""))
+
+    def _coord_disconnect(self, msg, state: _CoordState):
+        _, reply_q = msg
+        state.pending = [(aid, q) for aid, q in state.pending if q != reply_q]
+
+    def _parse_bets(self, payload: bytes) -> list[Bet]:
+        text = payload.decode("utf-8")
+        bets = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split(",")
+            bets.append(
+                Bet(
+                    int(parts[0]), parts[1], parts[2],
+                    int(parts[3]), parts[4], int(parts[5])
+                )
+            )
+        return bets
+
+    def _process_msg_bet(self, client_socket, payload, reply_queue) -> tuple[int, bool]:
+        bets = self._parse_bets(payload)
+        if not bets:
+            return 0, True
+            
+        self.coordinator_queue.put(("STORE_BETS", bets, reply_queue))
+        res = reply_queue.get()
+        
+        if isinstance(res, Exception):
+            raise res
+        if res is None:
+            return 0, False
+            
+        protocol.send_msg(client_socket, protocol.MSG_ACK)
+        return len(bets), True
+
+    def _process_msg_end_bets(self, client_socket, payload, reply_queue):
+        agency_id = int(payload.decode("utf-8").strip())
+        self.coordinator_queue.put(("END_BETS", agency_id, reply_queue))
+        winners_payload = reply_queue.get()
+        if winners_payload is not None:
+            protocol.send_msg(client_socket, protocol.MSG_WINNERS, winners_payload)
 
     def _handle_client(self, client_socket):
         action = "handle-client"
@@ -134,57 +182,19 @@ class Server:
             logger.info(action, logger.LogResult.in_progress)
             while self.is_running:
                 msg_type, payload = protocol.recv_msg(client_socket)
+                
                 if msg_type is None:
-                    logger.info(
-                        action,
-                        logger.LogResult.success,
-                        "messages-amount",
-                        message_amount,
-                    )
+                    logger.info(action, logger.LogResult.success, "messages-amount", message_amount)
                     return
 
                 if msg_type == protocol.MSG_BET:
-                    text = payload.decode("utf-8")
-                    bets = []
-                    for line in text.splitlines():
-                        line = line.strip()
-                        if not line:
-                            continue
-                        parts = line.split(",")
-                        agency_id = int(parts[0])
-                        first_name = parts[1]
-                        last_name = parts[2]
-                        document = int(parts[3])
-                        birthdate = parts[4]
-                        number = int(parts[5])
-                        bets.append(
-                            Bet(
-                                agency_id,
-                                first_name,
-                                last_name,
-                                document,
-                                birthdate,
-                                number,
-                            )
-                        )
-                    if bets:
-                        self.coordinator_queue.put(("STORE_BETS", bets, reply_queue))
-                        res = reply_queue.get()
-                        if isinstance(res, Exception):
-                            raise res
-                        if res is None:
-                            return
-                        message_amount += len(bets)
-                    protocol.send_msg(client_socket, protocol.MSG_ACK)
+                    count, continue_running = self._process_msg_bet(client_socket, payload, reply_queue)
+                    message_amount += count
+                    if not continue_running:
+                        return
 
                 elif msg_type == protocol.MSG_END_BETS:
-                    agency_id = int(payload.decode("utf-8").strip())
-                    self.coordinator_queue.put(("END_BETS", agency_id, reply_queue))
-                    winners_payload = reply_queue.get()
-                    if winners_payload is not None:
-                        protocol.send_msg(
-                            client_socket, protocol.MSG_WINNERS, winners_payload
-                        )
+                    self._process_msg_end_bets(client_socket, payload, reply_queue)
                     return
 
                 else:
@@ -192,9 +202,7 @@ class Server:
 
         except Exception as e:
             if self.is_running:
-                logger.error(
-                    action, logger.LogResult.fail, "messages-amount", message_amount, "err", e
-                )
+                logger.error(action, logger.LogResult.fail, "messages-amount", message_amount, "err", e)
         finally:
             self.coordinator_queue.put(("DISCONNECT", reply_queue))
             with self.lock:
