@@ -80,155 +80,152 @@ func (c *Client) connectToServer() error {
 	return err
 }
 
-func (client *Client) Run() error {
-	const mainAction = "send-bets"
-
-	if err := client.connectToServer(); err != nil {
-		if client.stopped.Load() {
-			return nil
-		}
-		logger.Warn("connect-to-server", logger.Fail)
-		return err
-	}
-	if client.stopped.Load() {
+func (c *Client) sendBatch(batch []string) error {
+	if len(batch) == 0 || c.stopped.Load() {
 		return nil
 	}
-	defer client.Stop()
-
-	inputFile, err := os.Open(client.config.InputFile)
-	if err != nil {
-		if client.stopped.Load() {
-			return nil
-		}
-		logger.Error("open-input-file", logger.Fail, "err", err, "path", client.config.InputFile)
+	
+	payload := []byte(strings.Join(batch, "\n") + "\n")
+	if err := protocol.SendMsg(c.conn, protocol.MsgBet, payload); err != nil {
+		if c.stopped.Load() { return nil }
+		logger.Error("send-bet-batch", logger.Fail, "agency-id", c.config.AgencyId, "bets", len(batch), "err", err)
 		return err
 	}
-	defer inputFile.Close()
 
-	outputFile, err := os.Create(client.config.OutputFile)
+	msgType, _, err := protocol.RecvMsg(c.conn)
 	if err != nil {
-		if client.stopped.Load() {
-			return nil
-		}
-		logger.Error("create-output-file", logger.Fail, "err", err, "path", client.config.OutputFile)
+		if c.stopped.Load() { return nil }
+		logger.Error("recv-ack", logger.Fail, "agency-id", c.config.AgencyId, "err", err)
 		return err
 	}
-	defer outputFile.Close()
+	
+	if msgType != protocol.MsgAck {
+		if c.stopped.Load() { return nil }
+		logger.Error("check-ack", logger.Fail, "agency-id", c.config.AgencyId, "expected", protocol.MsgAck, "got", msgType)
+		return fmt.Errorf("unexpected message type: %d", msgType)
+	}
 
-	logger.Info(mainAction, logger.InProgress, "agency-id", client.config.AgencyId)
+	return nil
+}
 
+func (c *Client) processBets(inputFile *os.File) (int, error) {
 	scanner := bufio.NewScanner(inputFile)
-	lineCount := 0
 	var batch []string
-
-	sendBatch := func() error {
-		if len(batch) == 0 {
-			return nil
-		}
-		payload := []byte(strings.Join(batch, "\n") + "\n")
-		if err := protocol.SendMsg(client.conn, protocol.MsgBet, payload); err != nil {
-			if client.stopped.Load() {
-				return nil
-			}
-			logger.Error("send-bet-batch", logger.Fail, "agency-id", client.config.AgencyId, "bets", len(batch), "err", err)
-			return err
-		}
-
-		msgType, _, err := protocol.RecvMsg(client.conn)
-		if err != nil {
-			if client.stopped.Load() {
-				return nil
-			}
-			logger.Error("recv-ack", logger.Fail, "agency-id", client.config.AgencyId, "err", err)
-			return err
-		}
-		if msgType != protocol.MsgAck {
-			if client.stopped.Load() {
-				return nil
-			}
-			logger.Error("check-ack", logger.Fail, "agency-id", client.config.AgencyId, "expected", protocol.MsgAck, "got", msgType)
-			return fmt.Errorf("unexpected message type: %d", msgType)
-		}
-
-		batch = batch[:0]
-		return nil
-	}
+	lineCount := 0
 
 	for scanner.Scan() {
-		if client.stopped.Load() {
-			return nil
+		if c.stopped.Load() {
+			return lineCount, nil
 		}
+		
 		line := strings.TrimSpace(scanner.Text())
 		if len(line) == 0 {
 			continue
 		}
+		
 		lineCount++
-		batch = append(batch, client.config.AgencyId+","+line)
+		batch = append(batch, c.config.AgencyId+","+line)
 
-		if len(batch) >= client.config.BatchSize {
-			if err := sendBatch(); err != nil {
-				return err
+		if len(batch) >= c.config.BatchSize {
+			if err := c.sendBatch(batch); err != nil {
+				return lineCount, err
 			}
+			batch = batch[:0]
 		}
-	}
-
-	if client.stopped.Load() {
-		return nil
 	}
 
 	if err := scanner.Err(); err != nil {
-		if client.stopped.Load() {
-			return nil
-		}
-		logger.Error("scan-file", logger.Fail, "agency-id", client.config.AgencyId, "err", err)
-		return err
+		if c.stopped.Load() { return lineCount, nil }
+		logger.Error("scan-file", logger.Fail, "agency-id", c.config.AgencyId, "err", err)
+		return lineCount, err
 	}
 
-	// Enviar remanente del último lote
-	if err := sendBatch(); err != nil {
-		return err
+	// Remanente
+	if len(batch) > 0 {
+		if err := c.sendBatch(batch); err != nil {
+			return lineCount, err
+		}
 	}
-	if client.stopped.Load() {
+
+	return lineCount, nil
+}
+
+func (c *Client) fetchAndWriteWinners(outputFile *os.File) error {
+	if c.stopped.Load() {
 		return nil
 	}
 
-	// Notificar fin de envío de apuestas y solicitar ganadores
-	if err := protocol.SendMsg(client.conn, protocol.MsgEndBets, []byte(client.config.AgencyId)); err != nil {
-		if client.stopped.Load() {
-			return nil
-		}
-		logger.Error("send-end-bets", logger.Fail, "agency-id", client.config.AgencyId, "err", err)
+	if err := protocol.SendMsg(c.conn, protocol.MsgEndBets, []byte(c.config.AgencyId)); err != nil {
+		if c.stopped.Load() { return nil }
+		logger.Error("send-end-bets", logger.Fail, "agency-id", c.config.AgencyId, "err", err)
 		return err
 	}
 
-	// Recibir listado de ganadores
-	msgType, winnersPayload, err := protocol.RecvMsg(client.conn)
+	msgType, winnersPayload, err := protocol.RecvMsg(c.conn)
 	if err != nil {
-		if client.stopped.Load() {
-			return nil
-		}
-		logger.Error("recv-winners", logger.Fail, "agency-id", client.config.AgencyId, "err", err)
+		if c.stopped.Load() { return nil }
+		logger.Error("recv-winners", logger.Fail, "agency-id", c.config.AgencyId, "err", err)
 		return err
 	}
+	
 	if msgType != protocol.MsgWinners {
-		if client.stopped.Load() {
-			return nil
-		}
-		logger.Error("check-winners", logger.Fail, "agency-id", client.config.AgencyId, "expected", protocol.MsgWinners, "got", msgType)
+		if c.stopped.Load() { return nil }
+		logger.Error("check-winners", logger.Fail, "agency-id", c.config.AgencyId, "expected", protocol.MsgWinners, "got", msgType)
 		return fmt.Errorf("unexpected message type: %d", msgType)
 	}
 
-	// Persistir los ganadores en el archivo de salida
 	if len(winnersPayload) > 0 {
 		if _, err := outputFile.Write(winnersPayload); err != nil {
-			if client.stopped.Load() {
-				return nil
-			}
-			logger.Error("write-output", logger.Fail, "agency-id", client.config.AgencyId, "err", err)
+			if c.stopped.Load() { return nil }
+			logger.Error("write-output", logger.Fail, "agency-id", c.config.AgencyId, "err", err)
 			return err
 		}
 	}
 
-	logger.Info(mainAction, logger.Success, "agency-id", client.config.AgencyId, "total-bets", lineCount)
+	return nil
+}
+
+func (c *Client) Run() error {
+	const mainAction = "send-bets"
+
+	if err := c.connectToServer(); err != nil {
+		if c.stopped.Load() { return nil }
+		logger.Warn("connect-to-server", logger.Fail)
+		return err
+	}
+	if c.stopped.Load() { return nil }
+	defer c.Stop()
+
+	inputFile, err := os.Open(c.config.InputFile)
+	if err != nil {
+		if c.stopped.Load() { return nil }
+		logger.Error("open-input-file", logger.Fail, "err", err, "path", c.config.InputFile)
+		return err
+	}
+	defer inputFile.Close()
+
+	outputFile, err := os.Create(c.config.OutputFile)
+	if err != nil {
+		if c.stopped.Load() { return nil }
+		logger.Error("create-output-file", logger.Fail, "err", err, "path", c.config.OutputFile)
+		return err
+	}
+	defer outputFile.Close()
+
+	logger.Info(mainAction, logger.InProgress, "agency-id", c.config.AgencyId)
+
+	lineCount, err := c.processBets(inputFile)
+	if err != nil {
+		return err
+	}
+
+	if err := c.fetchAndWriteWinners(outputFile); err != nil {
+		return err
+	}
+
+	if !c.stopped.Load() {
+		logger.Info(mainAction, logger.Success, "agency-id", c.config.AgencyId, "total-bets", lineCount)
+	}
+	
 	return nil
 }
