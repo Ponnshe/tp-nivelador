@@ -25,6 +25,45 @@ class Server:
 
         self.coordinator_queue = queue.Queue()
         self.is_running = True
+        self.server_socket = None
+        self.coordinator_thread = None
+        self.client_threads = []
+        self.client_sockets = set()
+        self.lock = threading.Lock()
+
+    def stop(self):
+        if not self.is_running:
+            return
+        self.is_running = False
+
+        if self.server_socket:
+            try:
+                self.server_socket.close()
+            except Exception:
+                pass
+
+        self.coordinator_queue.put(("STOP",))
+
+        with self.lock:
+            sockets_to_close = list(self.client_sockets)
+            threads_to_join = list(self.client_threads)
+
+        for s in sockets_to_close:
+            try:
+                s.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+            try:
+                s.close()
+            except Exception:
+                pass
+
+        if self.coordinator_thread and self.coordinator_thread.is_alive():
+            self.coordinator_thread.join(timeout=2.0)
+
+        for t in threads_to_join:
+            if t.is_alive():
+                t.join(timeout=2.0)
 
     def _run_coordinator(self):
         """Hilo coordinador: dueño exclusivo del estado de agencias y de la lotería."""
@@ -133,6 +172,8 @@ class Server:
                         res = reply_queue.get()
                         if isinstance(res, Exception):
                             raise res
+                        if res is None:
+                            return
                         message_amount += len(bets)
                     protocol.send_msg(client_socket, protocol.MSG_ACK)
 
@@ -150,11 +191,14 @@ class Server:
                     logger.warn("unknown-msg-type", logger.LogResult.fail, "type", msg_type)
 
         except Exception as e:
-            logger.error(
-                action, logger.LogResult.fail, "messages-amount", message_amount, "err", e
-            )
+            if self.is_running:
+                logger.error(
+                    action, logger.LogResult.fail, "messages-amount", message_amount, "err", e
+                )
         finally:
             self.coordinator_queue.put(("DISCONNECT", reply_queue))
+            with self.lock:
+                self.client_sockets.discard(client_socket)
             try:
                 client_socket.close()
             except Exception:
@@ -162,25 +206,34 @@ class Server:
 
     def run(self):
         action = "accept-connection"
-        coordinator_thread = threading.Thread(target=self._run_coordinator, daemon=True)
-        coordinator_thread.start()
+        self.coordinator_thread = threading.Thread(target=self._run_coordinator, daemon=True)
+        self.coordinator_thread.start()
 
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_socket:
-            server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            server_socket.bind((self.server_host, self.server_port))
-            server_socket.listen()
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server_socket.bind((self.server_host, self.server_port))
+        self.server_socket.listen()
+
+        try:
             while self.is_running:
                 try:
                     logger.info(action, logger.LogResult.in_progress)
-                    client_socket, _ = server_socket.accept()
-                except Exception as e:
+                    client_socket, _ = self.server_socket.accept()
+                except (OSError, Exception) as e:
                     if not self.is_running:
                         break
                     logger.error(action, logger.LogResult.fail)
                     raise e
                 logger.info(action, logger.LogResult.success)
 
+                with self.lock:
+                    self.client_sockets.add(client_socket)
+
                 client_thread = threading.Thread(
                     target=self._handle_client, args=(client_socket,), daemon=True
                 )
+                with self.lock:
+                    self.client_threads.append(client_thread)
                 client_thread.start()
+        finally:
+            self.stop()

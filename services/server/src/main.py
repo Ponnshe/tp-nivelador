@@ -1,4 +1,5 @@
 import os
+import signal
 import sys
 
 import logger
@@ -14,6 +15,14 @@ def main():
     s = server.Server(
         SERVER_HOST, SERVER_PORT, agency_quorum_min=AGENCY_QUORUM_MIN
     )
+
+    def handle_signal(signum, frame):
+        logger.info("server-signal", logger.LogResult.in_progress, "signal", signum)
+        s.stop()
+
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+
     try:
         s.run()
     except Exception as e:
