@@ -6,6 +6,8 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/7574-sistemas-distribuidos/tp-nivelador/src/logger"
@@ -25,48 +27,79 @@ type ClientConfig struct {
 }
 
 type Client struct {
-	conn   net.Conn
-	config ClientConfig
+	conn      net.Conn
+	config    ClientConfig
+	stopped   atomic.Bool
+	stopChan  chan struct{}
+	closeOnce sync.Once
 }
 
-func NewClient(config ClientConfig) (*Client, error) {
-	conn, err := connectToServer(config.ServerHost, config.ServerPort)
-	if err != nil {
-		logger.Warn("connect-to-server", logger.Fail)
-		return nil, err
+func NewClient(config ClientConfig) *Client {
+	return &Client{
+		config:   config,
+		stopChan: make(chan struct{}),
 	}
-
-	client := &Client{conn: conn, config: config}
-	return client, nil
 }
 
-func connectToServer(host, port string) (net.Conn, error) {
+func (c *Client) Stop() {
+	c.closeOnce.Do(func() {
+		c.stopped.Store(true)
+		close(c.stopChan)
+		if c.conn != nil {
+			c.conn.Close()
+		}
+	})
+}
+
+func (c *Client) connectToServer() error {
 	const action = "connect-to-server"
 	var err error
-	var conn net.Conn
 
 	logger.Info(action, logger.InProgress)
 	for i := range CONNECTION_ATTEMPTS_MAX {
-		conn, err = net.Dial("tcp", host+":"+port)
-		if err != nil {
-			logger.Warn(action, logger.Fail, "attempt", i)
-			time.Sleep(CONNECTION_ATTEMPS_DELAY_MS * time.Millisecond)
-			continue
+		if c.stopped.Load() {
+			return nil
 		}
 
-		logger.Info(action, logger.Success)
-		break
+		conn, dialErr := net.Dial("tcp", c.config.ServerHost+":"+c.config.ServerPort)
+		if dialErr == nil {
+			c.conn = conn
+			logger.Info(action, logger.Success)
+			return nil
+		}
+		err = dialErr
+
+		logger.Warn(action, logger.Fail, "attempt", i)
+		select {
+		case <-c.stopChan:
+			return nil
+		case <-time.After(CONNECTION_ATTEMPS_DELAY_MS * time.Millisecond):
+		}
 	}
 
-	return conn, err
+	return err
 }
 
 func (client *Client) Run() error {
 	const mainAction = "send-bets"
-	defer client.conn.Close()
+
+	if err := client.connectToServer(); err != nil {
+		if client.stopped.Load() {
+			return nil
+		}
+		logger.Warn("connect-to-server", logger.Fail)
+		return err
+	}
+	if client.stopped.Load() {
+		return nil
+	}
+	defer client.Stop()
 
 	inputFile, err := os.Open(client.config.InputFile)
 	if err != nil {
+		if client.stopped.Load() {
+			return nil
+		}
 		logger.Error("open-input-file", logger.Fail, "err", err, "path", client.config.InputFile)
 		return err
 	}
@@ -74,6 +107,9 @@ func (client *Client) Run() error {
 
 	outputFile, err := os.Create(client.config.OutputFile)
 	if err != nil {
+		if client.stopped.Load() {
+			return nil
+		}
 		logger.Error("create-output-file", logger.Fail, "err", err, "path", client.config.OutputFile)
 		return err
 	}
@@ -91,16 +127,25 @@ func (client *Client) Run() error {
 		}
 		payload := []byte(strings.Join(batch, "\n") + "\n")
 		if err := protocol.SendMsg(client.conn, protocol.MsgBet, payload); err != nil {
+			if client.stopped.Load() {
+				return nil
+			}
 			logger.Error("send-bet-batch", logger.Fail, "agency-id", client.config.AgencyId, "bets", len(batch), "err", err)
 			return err
 		}
 
 		msgType, _, err := protocol.RecvMsg(client.conn)
 		if err != nil {
+			if client.stopped.Load() {
+				return nil
+			}
 			logger.Error("recv-ack", logger.Fail, "agency-id", client.config.AgencyId, "err", err)
 			return err
 		}
 		if msgType != protocol.MsgAck {
+			if client.stopped.Load() {
+				return nil
+			}
 			logger.Error("check-ack", logger.Fail, "agency-id", client.config.AgencyId, "expected", protocol.MsgAck, "got", msgType)
 			return fmt.Errorf("unexpected message type: %d", msgType)
 		}
@@ -110,6 +155,9 @@ func (client *Client) Run() error {
 	}
 
 	for scanner.Scan() {
+		if client.stopped.Load() {
+			return nil
+		}
 		line := strings.TrimSpace(scanner.Text())
 		if len(line) == 0 {
 			continue
@@ -124,7 +172,14 @@ func (client *Client) Run() error {
 		}
 	}
 
+	if client.stopped.Load() {
+		return nil
+	}
+
 	if err := scanner.Err(); err != nil {
+		if client.stopped.Load() {
+			return nil
+		}
 		logger.Error("scan-file", logger.Fail, "agency-id", client.config.AgencyId, "err", err)
 		return err
 	}
@@ -133,9 +188,15 @@ func (client *Client) Run() error {
 	if err := sendBatch(); err != nil {
 		return err
 	}
+	if client.stopped.Load() {
+		return nil
+	}
 
 	// Notificar fin de envío de apuestas y solicitar ganadores
 	if err := protocol.SendMsg(client.conn, protocol.MsgEndBets, []byte(client.config.AgencyId)); err != nil {
+		if client.stopped.Load() {
+			return nil
+		}
 		logger.Error("send-end-bets", logger.Fail, "agency-id", client.config.AgencyId, "err", err)
 		return err
 	}
@@ -143,10 +204,16 @@ func (client *Client) Run() error {
 	// Recibir listado de ganadores
 	msgType, winnersPayload, err := protocol.RecvMsg(client.conn)
 	if err != nil {
+		if client.stopped.Load() {
+			return nil
+		}
 		logger.Error("recv-winners", logger.Fail, "agency-id", client.config.AgencyId, "err", err)
 		return err
 	}
 	if msgType != protocol.MsgWinners {
+		if client.stopped.Load() {
+			return nil
+		}
 		logger.Error("check-winners", logger.Fail, "agency-id", client.config.AgencyId, "expected", protocol.MsgWinners, "got", msgType)
 		return fmt.Errorf("unexpected message type: %d", msgType)
 	}
@@ -154,6 +221,9 @@ func (client *Client) Run() error {
 	// Persistir los ganadores en el archivo de salida
 	if len(winnersPayload) > 0 {
 		if _, err := outputFile.Write(winnersPayload); err != nil {
+			if client.stopped.Load() {
+				return nil
+			}
 			logger.Error("write-output", logger.Fail, "agency-id", client.config.AgencyId, "err", err)
 			return err
 		}
